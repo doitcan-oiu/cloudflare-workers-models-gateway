@@ -32,7 +32,7 @@ async function cloudflareFetch(env: Env, path: string, options: RequestInit = {}
   } catch { throw new ApiError(502, 'cloudflare_connection_error', '无法连接 Cloudflare API，请稍后重试'); }
   if (!response.ok) {
     await response.body?.cancel();
-    if ([401, 403].includes(response.status)) throw new ApiError(502, 'cloudflare_permission_denied', 'Cloudflare 拒绝访问，请检查 CF_API_TOKEN 的账户范围与 AI Gateway / Account Analytics / Secrets Store 权限');
+    if ([401, 403].includes(response.status)) throw new ApiError(502, 'cloudflare_permission_denied', 'Cloudflare 拒绝访问，请检查 CF_API_TOKEN 的账户范围与 AI Gateway / Account Analytics 权限');
     if (response.status === 404) throw new ApiError(404, 'cloudflare_not_found', 'Cloudflare 上不存在该资源，请检查 Account ID、Gateway ID 或服务商 ID');
     if (response.status === 429) throw new ApiError(429, 'cloudflare_rate_limited', 'Cloudflare API 已限流，请稍后重试');
     throw new ApiError(response.status === 409 ? 409 : 502, 'cloudflare_api_error', `Cloudflare API 返回 ${response.status}；请检查服务商 slug 是否重复及配置是否有效`);
@@ -53,30 +53,4 @@ export async function cfGraphql<T>(env: Env, query: string): Promise<T> {
 export function publicProvider(provider: CustomProvider): CustomProvider {
   // Never return provider headers or secret-bearing configuration to the browser.
   return { id: provider.id, name: provider.name, slug: provider.slug, base_url: provider.base_url, enable: provider.enable, description: provider.description, created_at: provider.created_at };
-}
-
-export async function storeByok(env: Env, slug: string, alias: string, secret: string) {
-  const storesPath = `/accounts/${accountId(env)}/secrets_store/stores`;
-  let storeId = env.SECRETS_STORE_ID;
-  if (!storeId) {
-    const stores = await cfApi<{ id: string }[]>(env, `${storesPath}?per_page=2`);
-    if (!Array.isArray(stores.result) || stores.result.length !== 1 || (stores.result_info?.total_count ?? 1) > 1) {
-      throw new ApiError(503, 'secrets_store_setup_required', '请在 Cloudflare 创建 Secrets Store 并配置 SECRETS_STORE_ID；也可使用已存在的 BYOK 别名');
-    }
-    storeId = stores.result[0].id;
-  }
-  if (!/^[a-f0-9]{32}$/i.test(storeId)) throw new ApiError(503, 'secrets_store_setup_required', 'SECRETS_STORE_ID 格式无效');
-  // AI Gateway resolves API-created secrets by this exact name, not by secret_id.
-  const name = `${gatewayId(env)}_custom-${slug}_${alias}`;
-  const created = await cfApi<{ id: string }[]>(env, `${storesPath}/${storeId}/secrets`, {
-    method: 'POST', body: JSON.stringify([{ name, scopes: ['ai_gateway'], value: secret }]),
-  });
-  const id = created.result?.[0]?.id;
-  if (!id) throw new ApiError(502, 'cloudflare_invalid_response', 'Cloudflare 未返回新建密钥 ID');
-  try {
-    await cfApi(env, `${gatewayPath(env)}/provider_configs`, { method: 'POST', body: JSON.stringify({ provider_slug: `custom-${slug}`, alias, default_config: false, secret_id: id }) });
-  } catch (error) {
-    const reason = error instanceof ApiError ? error.message : '关联失败';
-    throw new ApiError(502, 'byok_association_failed', `${reason}；密钥已写入 Secrets Store（名称 ${name}），请在 Cloudflare 完成 BYOK 关联后使用别名 ${alias}`);
-  }
 }

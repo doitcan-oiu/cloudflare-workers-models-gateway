@@ -19,8 +19,7 @@
   "kv_namespaces": [{ "binding": "KV", "id": "00000000000000000000000000000000" }],
   "vars": {
     "CLOUDFLARE_ACCOUNT_ID": "",
-    "AI_GATEWAY_ID": "default",
-    "SECRETS_STORE_ID": ""
+    "AI_GATEWAY_ID": "default"
   },
   "triggers": { "crons": ["15 3 * * *"] },
   "observability": { "enabled": true, "head_sampling_rate": 0.1 }

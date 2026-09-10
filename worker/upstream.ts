@@ -1,10 +1,11 @@
 import type { Candidate, Channel, Env, Route } from './types';
-import { decryptSecret } from './lib/crypto';
+import { decryptSecret, encryptionConfigured } from './lib/crypto';
 import type { InferenceInput } from './protocols/convert';
 import { inferenceToken } from './cloudflare';
 
 export function channelConfigured(channel: Channel, env: Env) {
-  if (channel.kind === 'openai') return /^[a-f0-9]{32}$/i.test(env.CLOUDFLARE_ACCOUNT_ID || '') && !!inferenceToken(env) && !!channel.provider_id && !!channel.provider_slug && !!channel.byok_alias;
+  if (channel.kind === 'openai') return /^[a-f0-9]{32}$/i.test(env.CLOUDFLARE_ACCOUNT_ID || '') && !!inferenceToken(env) && !!channel.provider_id && !!channel.provider_slug &&
+    (channel.secret_encrypted ? encryptionConfigured(env.ENCRYPTION_KEY) : !!channel.byok_alias);
   const token = channel.kind === 'cloudflare' ? env.CF_AI_TOKEN : inferenceToken(env);
   return /^[a-f0-9]{32}$/i.test(env.CLOUDFLARE_ACCOUNT_ID || '') && !!(channel.secret_encrypted || token);
 }
@@ -53,7 +54,12 @@ export async function requestUpstream(env: Env, candidate: Candidate, input: Inf
   } else {
     url = `https://gateway.ai.cloudflare.com/v1/${env.CLOUDFLARE_ACCOUNT_ID}/${encodeURIComponent(env.AI_GATEWAY_ID || 'default')}/custom-${encodeURIComponent(channel.provider_slug!)}/${channel.gateway_path}`;
     headers.set('cf-aig-authorization', `Bearer ${inferenceToken(env)}`);
-    headers.set('cf-aig-byok-alias', channel.byok_alias);
+    if (channel.secret_encrypted) {
+      if (channel.protocol === 'anthropic') headers.set('x-api-key', token!);
+      else headers.set('Authorization', `Bearer ${token}`);
+    } else {
+      headers.set('cf-aig-byok-alias', channel.byok_alias);
+    }
   }
   if (channel.protocol === 'anthropic') {
     headers.set('anthropic-version', inboundHeaders?.get('anthropic-version') || '2023-06-01');

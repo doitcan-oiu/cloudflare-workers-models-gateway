@@ -25,7 +25,6 @@ export interface Log {
 export interface LogPage { data: Log[]; total: number | null; page: number; page_size: number; has_more: boolean; source: 'cloudflare' }
 export interface Config {
   account_id: string; gateway_id: string; ai_token_configured: boolean; aig_token_configured: boolean;
-  secrets_store_id: string;
   encryption_configured: boolean; control_token_configured: boolean; observability_source: 'cloudflare'; dashboard_url: string;
 }
 export interface Stats {

@@ -1,5 +1,4 @@
 export interface Env {
-  SECRETS_STORE_ID?: string;
   DB: D1Database;
   KV: KVNamespace;
   ASSETS: Fetcher;

@@ -6,7 +6,7 @@
 
 基于 **Cloudflare Workers + AI Gateway + D1 + KV** 的大模型网关管理程序。React 19 + HeroUI 3 + Tailwind CSS 4 前端，Hono + TypeScript 后端。功能参考 AxonHub 的统一模型接入场景，目前为单管理员、单工作空间。
 
-**自定义服务商的推理请求全部经过 Cloudflare AI Gateway。** 本程序调用 Cloudflare API 管理服务商和 BYOK，直接读取 Cloudflare 日志与 GraphQL 分析，不再向 D1 写入推理日志或自行计算费用。
+**自定义服务商的推理请求全部经过 Cloudflare AI Gateway。** 供应商 API Key 默认由本程序加密保存在 D1，无需配置 BYOK 或 Secrets Store。本程序调用 Cloudflare API 管理服务商，直接读取 Cloudflare 日志与 GraphQL 分析，不向 D1 写入推理日志或自行计算费用。
 
 部署请阅读 [Workers 部署指南](./DEPLOYMENT.md)，包含 GitHub 自动部署、一键部署按钮、命令行部署和首次配置步骤。
 
@@ -18,23 +18,22 @@ flowchart LR
     UI[React 管理控制台] -->|管理会话| Worker
     Worker -->|推理| AIG[Cloudflare AI Gateway]
     AIG --> Custom[自定义服务商]
-    Worker -->|服务商 / BYOK / 日志 / 分析| API[Cloudflare REST + GraphQL API]
-    AIG --> Secrets[Cloudflare Secrets Store · BYOK]
-    Worker --> D1[(D1 · 业务配置与配额)]
+    Worker -->|服务商 / 日志 / 分析| API[Cloudflare REST + GraphQL API]
+    Worker --> D1[(D1 · 加密供应商密钥 / 业务配置 / 配额)]
     Worker --> KV[(KV · 会话与分析 Schema 缓存)]
 ```
 
 | 能力 | 实现位置 |
 | --- | --- |
 | 自定义服务商注册、查询、修改与删除 | Cloudflare Custom Providers API，账户级资源 |
-| 供应商密钥 | Cloudflare Secrets Store + AI Gateway Provider Configs |
+| 供应商密钥 | 默认 AES-256-GCM 加密保存到 D1，也可引用已有 Cloudflare BYOK 别名 |
 | 模型转发、日志采集、缓存、用量与费用数据 | Cloudflare AI Gateway |
 | 日志列表与详情 | Worker 代理 Cloudflare Logs REST API |
 | 总览、趋势、模型分布 | Cloudflare GraphQL `aiGatewayRequestsAdaptiveGroups` |
 | 应用 API Key、模型权限、模型别名、渠道映射、原子配额 | Worker + D1 |
 | 管理员会话 | Workers KV |
 
-前端静态资源和 API 由同一个 Worker 提供。管理接口不把 Cloudflare Token 或供应商密钥返回浏览器。客户端 API Key 仅保存 SHA-256 哈希。自定义服务商密钥不保存到 D1；其他 Cloudflare 渠道的可选 Token 覆盖值仍使用 AES-256-GCM 加密。
+前端静态资源和 API 由同一个 Worker 提供。管理接口不把 Cloudflare Token、供应商密钥明文或密文返回浏览器。客户端 API Key 仅保存 SHA-256 哈希。供应商密钥和 Cloudflare 渠道的可选 Token 覆盖值使用 AES-256-GCM 加密，密文与渠道 ID 绑定；加密主密钥 `ENCRYPTION_KEY` 保存在 Worker Secret 中。
 
 前端使用 HeroUI 的按钮、输入框、选择器、弹窗、开关、复选框、状态标签及页签，采用中性炭黑背景、深灰卡片与翠绿色强调色，使用顶部导航、流量工作台、渠道资源列表、模型目录与路由详情、密钥权限卡片，以及分组的侧边编辑抽屉。Playground 将对话与参数并列展示，设置页按连接、凭据与接入代码分类。主题变量统一在 `src/styles.css` 中定义；各管理页面按需加载，支持窄屏导航。
 
@@ -59,11 +58,11 @@ npm run dev
 1. 在 Cloudflare 创建一个 AI Gateway，开启网关认证并检查日志采集设置。
 2. 在 `wrangler.jsonc` 的 `vars` 填写 `CLOUDFLARE_ACCOUNT_ID`（32 位 Account ID）和 `AI_GATEWAY_ID`（网关名称/ID）。
 3. 在 `.dev.vars` 添加 `CF_API_TOKEN`。Token 需授权目标账户的 **AI Gateway Read/Edit** 和 **Account Analytics Read**。
-4. 如果要在本程序输入供应商 API Key，Token 还需 **Secrets Store Edit** 权限，并在 Cloudflare 创建 Secrets Store。可在 `vars.SECRETS_STORE_ID` 指定 Store ID；留空时仅在账户恰好有一个 Store 时自动采用它。程序不自动创建 Store。
-5. 可选：添加独立的 `CF_AIG_TOKEN` 用于推理认证；不配置时使用 `CF_API_TOKEN`，此时它还必须包含 **AI Gateway Run** 权限。独立推理 Token 同样需要 AI Gateway Run 权限。仅使用已有 BYOK 别名时不需要本程序读取或写入 Secrets Store。
+4. 确认 `.dev.vars` 中已有有效的 `ENCRYPTION_KEY`，用于加密供应商 API Key。无需创建 Secrets Store 或授予 Secrets Store 权限。
+5. 可选：添加独立的 `CF_AIG_TOKEN` 用于推理认证；不配置时使用 `CF_API_TOKEN`，此时它还必须包含 **AI Gateway Run** 权限。独立推理 Token 同样需要 AI Gateway Run 权限。
 6. 重启开发服务器。
 
-云端 API 始终连接真实 Cloudflare 账户，即使程序运行在本地。新增服务商、输入供应商密钥和 Playground 调用会实际修改云端配置或调用模型。
+云端 API 始终连接真实 Cloudflare 账户，即使程序运行在本地。新增服务商会修改云端配置，Playground 会实际调用模型；输入的供应商密钥保存在当前环境的 D1 中。
 
 ## 添加自定义服务商与渠道
 
@@ -71,7 +70,7 @@ npm run dev
 
 - **创建服务商**：填写名称、账户内唯一的 slug、HTTPS Base URL。保存时调用 Cloudflare Custom Providers API。
 - **关联已有服务商**：从 Cloudflare 实时列表中选择，支持搜索和分页，不重复创建服务商。
-- **设置凭据**：填写供应商 API Key，或者已有的 BYOK 别名。输入新 Key 会先创建 Secrets Store secret，再调用网关的 `provider_configs` API 建立关联。
+- **设置凭据**：默认选择「程序加密存储」，填写供应商 API Key 即可。编辑时留空保留原密钥，填入新值则替换。已有 Cloudflare BYOK 配置也可选择「使用已有 Cloudflare BYOK 别名」。
 - **设置请求路径**：请求路径会拼接到供应商的 Base URL 后面。程序使用 Cloudflare 的 Provider Native 自定义端点，不依赖 `/compat` 来转发自定义服务商。
 
 例如供应商的实际 Chat Completions 地址是 `https://api.example.com/v1/chat/completions`：
@@ -89,13 +88,13 @@ npm run dev
 https://gateway.ai.cloudflare.com/v1/{account}/{gateway}/custom-{slug}/{path}
 ```
 
-Worker 只附带 `cf-aig-authorization`、`cf-aig-byok-alias` 和关联元数据，由 AI Gateway 从 Secrets Store 取出供应商密钥。
+程序加密存储模式下，Worker 解密供应商密钥，根据服务商协议添加认证头：OpenAI 使用 `Authorization: Bearer <供应商 API Key>`，Anthropic 使用 `x-api-key: <供应商 API Key>`。`cf-aig-authorization` 单独携带 Cloudflare 推理 Token。客户端的应用 API Key 不会转发给上游。
 
-上传密钥时使用 Cloudflare 要求的 secret 名称 `{gateway_id}_custom-{slug}_{alias}`，scope 为 API 定义的 `ai_gateway`。每次换 Key 都创建独立随机别名，不覆盖其他渠道的凭据。旧 BYOK 和 secret 不自动删除，可在确认没有其他使用方后通过 Cloudflare 管理。
+使用已有 BYOK 别名时，Worker 改为发送 `cf-aig-byok-alias`，由 AI Gateway 使用其已配置的密钥；本程序不再调用 Secrets Store 或上传 / 修改 BYOK。两种模式互斥，切换为本地加密存储需重新输入供应商 API Key；切换为已有 BYOK 时会清除当前渠道在 D1 中保存的密文。
 
 「Cloudflare 服务商」页直接管理账户资源。修改名称、描述、启用状态会调用 Cloudflare API。为避免将共享凭据转发到其他地址，此页面不允许更改已有服务商的 slug / Base URL；需要变更目的地时新建服务商。删除本地渠道仅删除本地渠道及路由；删除 Cloudflare 服务商会影响账户内所有使用它的网关，界面会提示此影响，并阻止删除仍被本程序渠道使用的服务商。
 
-Cloudflare 与 D1 之间没有跨服务事务。如果服务商、secret 或 BYOK 已创建而后续步骤失败，错误会给出可用于恢复的资源信息。不要反复创建同一个 slug；从已有服务商重新关联，必要时在 Cloudflare 完成 BYOK 关联。
+Cloudflare 与 D1 之间没有跨服务事务。如果服务商已创建但渠道保存失败，错误会给出服务商信息。可以从已有服务商重新关联并填写凭据。密钥不会上传到 Cloudflare 控制 API；推理时会随认证头发送给 AI Gateway。
 
 ### 模型与应用接入
 
@@ -132,7 +131,7 @@ curl https://YOUR-WORKER.workers.dev/v1/chat/completions \
 
 Anthropic 服务商常用路径是 `v1/messages`（Base URL 已包含 `/v1` 时填 `messages`），OpenAI 为 `v1/chat/completions`。在服务商页切换协议会自动调整这些标准路径，特殊自定义路径需在渠道中手动调整。
 
-两种端点均接受应用 `Authorization: Bearer eg_…` 或 `x-api-key: eg_…`。客户端的凭据不会转发给供应商，Cloudflare 认证和 BYOK 仍由服务端设置。Anthropic 请求示例：
+两种端点均接受应用 `Authorization: Bearer eg_…` 或 `x-api-key: eg_…`。客户端的凭据不会转发给供应商，Cloudflare 认证和供应商认证由服务端独立设置。Anthropic 请求示例：
 
 ```bash
 curl https://YOUR-WORKER.workers.dev/v1/messages \
@@ -149,7 +148,7 @@ curl https://YOUR-WORKER.workers.dev/v1/messages \
 - 同协议请求保留原协议扩展。跨协议不支持的参数（如扩展 thinking、提示缓存控制、服务端工具、音频、JSON response_format、多候选 `n > 1`、Anthropic `top_k`）返回明确的 `unsupported_conversion`。存在同协议可用路由时可跳过无法转换的候选。
 - OpenAI → Anthropic 未指定输出长度时使用 `max_tokens=4096`；Anthropic 的温度范围要求为 0–1，程序不悄悄截断超出范围的温度。实际模型仍可能有更严格要求。
 - Anthropic 客户端调用 OpenAI 服务商时，流式请求会向上游请求 `include_usage`。Anthropic 的初始流式计数从 0 开始，结束事件更新为上游报告值；若上游缺少必要用量、缺少结束事件或出现无法表示的内容，转换会报错。不会为此向 D1 写入日志或计算账单。
-- 协议转换不改变自定义服务商的认证方式。服务商需接受当前 Cloudflare BYOK 对该自定义端点配置的认证；仅接受特定认证头的服务商需在 Cloudflare 配置相应认证。此处没有假设 Cloudflare 未公开的自定义认证模板字段。
+- 供应商认证按上游协议选择：OpenAI 使用 Bearer，Anthropic 使用 `x-api-key`。故障转移时按候选渠道重新选择密钥和认证头。其他私有认证方式尚不支持；已有 BYOK 模式使用 Cloudflare 对应的凭据配置。
 
 ## 服务商标签与模型并集
 
@@ -220,7 +219,13 @@ npm run db:migrate:remote
 
 `0002_ai_gateway_control_plane.sql` 为渠道增加 Cloudflare 服务商 ID、slug、请求路径、BYOK 别名。保留原模型、应用密钥、配额与历史 `request_logs` 表；旧日志不会删除，但新程序不再读写该表或运行日志清理任务。定时任务现在只清理过期配额计数。
 
-旧「OpenAI 兼容」直连渠道会显示待配置，**不会继续直连供应商**。编辑渠道，将其关联到 Cloudflare 服务商，并确认请求路径。仅当完整上游 URL 与旧地址完全一致时，旧加密 Key 才可迁入 BYOK；目的地不一致需重新输入密钥或提供已有 BYOK 别名。迁移成功后清除 D1 中该渠道的供应商密钥。
+旧「OpenAI 兼容」直连渠道会显示待配置，**不会继续直连供应商**。编辑渠道，将其关联到 Cloudflare 服务商，并确认请求路径。仅当完整上游 URL 与旧地址完全一致时，才会保留原有加密 Key；目的地不一致需重新输入密钥或提供已有 BYOK 别名。关联后推理经过 AI Gateway，密钥继续加密保存在 D1。
+
+### 从 BYOK 版本升级
+
+现有 BYOK 渠道继续使用原别名，不需要重新创建。要改为程序加密存储，编辑渠道，选择「程序加密存储」，重新输入供应商 API Key 并保存。Cloudflare 中原有的 BYOK 配置不会被删除。本次存储方式变更复用已有 `secret_encrypted` 列，无需新增数据库迁移。
+
+新版一键部署已移除 `SECRETS_STORE_ID`，旧环境里的同名变量可删除。`CF_API_TOKEN` 不再需要 Secrets Store 权限。后续部署必须保留原来的 `ENCRYPTION_KEY`；更换主密钥前应重新配置所有使用旧密钥加密的凭据。
 
 ## 部署
 
@@ -252,7 +257,7 @@ worker/
   auth.ts               管理会话、应用 API Key 鉴权
   admin.ts              业务配置管理
   channels.ts           Cloudflare 服务商与本地渠道映射
-  cloudflare.ts          REST / GraphQL 客户端、Secrets Store / BYOK
+  cloudflare.ts          Cloudflare REST / GraphQL 客户端
   observability.ts       Cloudflare 日志与分析
   gateway.ts            应用配额、故障转移与 SSE 透传
   upstream.ts           AI Gateway 端点与标签范围内的路由选择
@@ -273,16 +278,14 @@ npm audit
 npx wrangler deploy --dry-run
 ```
 
-测试在隔离的 D1 / KV 中运行，模拟 Cloudflare 控制 API、Secrets Store 和推理响应，并禁止供应商直连。覆盖真实 Worker 运行时中的鉴权、并发配额、服务商管理、BYOK 命名与关联、迁移、故障转移、SSE、日志分页和 GraphQL 聚合。测试不调用真实供应商；未提供账户凭据时无法完成云端联调。
+测试在隔离的 D1 / KV 中运行，模拟 Cloudflare 控制 API 和推理响应，并禁止供应商直连及 Secrets Store 操作。覆盖真实 Worker 运行时中的鉴权、并发配额、服务商管理、密钥加密与轮换、旧 BYOK 兼容、升级、跨协议认证与故障转移、SSE、日志分页和 GraphQL 聚合。测试不调用真实供应商；未提供账户凭据时无法完成云端联调。
 
 当前未实现多租户 / RBAC、充值或硬金额预算、Responses、embeddings、图像 / 音频接口、熔断与长期健康探测。前端同源访问；管理 / Playground 请求体上限 64 KiB，推理请求体 2 MiB，非流式上游响应 8 MiB。
 
 ## 官方参考
 
 - [Custom Providers API 与推理地址](https://developers.cloudflare.com/ai-gateway/configuration/custom-providers/)
-- [BYOK 与 API 创建密钥命名约定](https://developers.cloudflare.com/ai-gateway/configuration/bring-your-own-keys/)
-- [Secrets Store 创建密钥 API](https://developers.cloudflare.com/api/resources/secrets_store/subresources/stores/subresources/secrets/methods/create/)
-- [Secrets Store 权限](https://developers.cloudflare.com/secrets-store/access-control/)
+- [已有 BYOK 配置](https://developers.cloudflare.com/ai-gateway/configuration/bring-your-own-keys/)
 - [AI Gateway Logs API](https://developers.cloudflare.com/api/resources/ai_gateway/subresources/logs/methods/list/)
 - [AI Gateway GraphQL Analytics](https://developers.cloudflare.com/ai-gateway/observability/analytics/)
 - [Cloudflare AI REST API](https://developers.cloudflare.com/ai-gateway/usage/rest-api/)

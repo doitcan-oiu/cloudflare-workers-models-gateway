@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import type { AppEnv, Model, Route } from './types';
 import { ApiError, invalid } from './lib/errors';
-import { randomToken, sha256 } from './lib/crypto';
+import { encryptionConfigured, randomToken, sha256 } from './lib/crypto';
 import { modelSchema, routeSchema, keySchema } from './lib/validation';
 import { channels } from './channels';
 import { logs, logDetail, stats } from './observability';
@@ -10,9 +10,8 @@ export const admin = new Hono<AppEnv>();
 admin.get('/config', c => c.json({
   account_id: c.env.CLOUDFLARE_ACCOUNT_ID || '', gateway_id: c.env.AI_GATEWAY_ID || 'default',
   ai_token_configured: !!c.env.CF_AI_TOKEN, aig_token_configured: !!c.env.CF_AIG_TOKEN,
-  encryption_configured: !!c.env.ENCRYPTION_KEY,
+  encryption_configured: encryptionConfigured(c.env.ENCRYPTION_KEY),
   control_token_configured: !!c.env.CF_API_TOKEN,
-  secrets_store_id: c.env.SECRETS_STORE_ID || '',
   observability_source: 'cloudflare',
   dashboard_url: `https://dash.cloudflare.com/${c.env.CLOUDFLARE_ACCOUNT_ID || ''}/ai/ai-gateway`,
 }));

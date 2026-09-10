@@ -10,7 +10,7 @@
 | Deploy to Cloudflare 按钮 | 从公开 GitHub 仓库快速创建一套应用 | 按引导创建资源，填写 AI Gateway 配置和 Secrets |
 | 本地 Wrangler | 从本地发布，便于观察首次部署过程 | 登录 Cloudflare，创建资源，运行部署命令 |
 
-**可以从 GitHub 部署。** 自用推荐直接连接仓库；如果希望提供“一键部署”，可以使用 Cloudflare 官方按钮。按钮流程可以创建 D1 / KV，并更新新仓库里的资源 ID。本项目所使用的 AI Gateway、BYOK Secrets Store 和 Cloudflare Token 仍需按下文准备。[Cloudflare 部署按钮说明](https://developers.cloudflare.com/workers/platform/deploy-buttons/)
+**可以从 GitHub 部署。** 自用推荐直接连接仓库；如果希望提供“一键部署”，可以使用 Cloudflare 官方按钮。按钮流程可以创建 D1 / KV，并更新新仓库里的资源 ID。AI Gateway 和 Cloudflare Token 仍需按下文准备；供应商密钥由程序加密存入 D1，无需 Secrets Store。[Cloudflare 部署按钮说明](https://developers.cloudflare.com/workers/platform/deploy-buttons/)
 
 以下三种部署方式选择一种即可；第 2 节的配置和第 6 节的验收通用。仅提交到本地 Git 不会出现在 GitHub，需要你之后自行将仓库上传到 GitHub，才可连接在线构建。
 
@@ -23,14 +23,13 @@
 | 资源 | 本项目配置名 | 用途 |
 | --- | --- | --- |
 | Worker | `name`，默认 `edgegate` | 管理界面和 `/api/*`、`/v1/*` API |
-| D1 数据库 | 绑定名 `DB` | 渠道、模型、应用密钥哈希、标签及配额 |
+| D1 数据库 | 绑定名 `DB` | 渠道、加密供应商密钥、模型、应用密钥哈希、标签及配额 |
 | KV 命名空间 | 绑定名 `KV` | 管理员会话、分析 Schema 缓存 |
 | AI Gateway | `vars.AI_GATEWAY_ID` | 转发推理、保存日志、提供分析 |
-| Secrets Store | `vars.SECRETS_STORE_ID` | 输入供应商 API Key 时，为 BYOK 存储密钥 |
 
 在 Cloudflare 控制台进入 **AI Gateway**，创建或选择一个网关，记下它的 ID；建议首次先明确创建和检查网关。Cloudflare 也支持首次认证请求自动创建 `default` 网关，但自定义服务商 / BYOK 配置前仍应确认网关存在及其设置。[网关管理说明](https://developers.cloudflare.com/ai-gateway/configuration/manage-gateway/)
 
-打开网关认证，并检查日志采集、请求 / 响应正文保留等设置。若要在 EdgeGate 中输入供应商密钥，先在 Cloudflare 的 **Secrets Store** 创建一个 Store。若只关联已有 BYOK 别名，可不使用 EdgeGate 的密钥上传功能。
+打开网关认证，并检查日志采集、请求 / 响应正文保留等设置。供应商密钥默认由 EdgeGate 使用 `ENCRYPTION_KEY` 加密保存，不需要创建 Secrets Store。已经配置好的 Cloudflare BYOK 别名也可以继续使用。
 
 ### 2.2 普通变量
 
@@ -40,9 +39,8 @@
 | --- | --- |
 | `CLOUDFLARE_ACCOUNT_ID` | AI Gateway 所属账户的 32 位 Account ID；不是 Zone ID |
 | `AI_GATEWAY_ID` | 网关的 ID，例如 `default` 或 `edgegate`；不是完整 URL |
-| `SECRETS_STORE_ID` | 32 位 Store ID。上传密钥时，留空仅支持账户中恰好存在一个 Store；有多个 Store 必须指定 |
 
-如果只用已有 BYOK 别名，`SECRETS_STORE_ID` 可以留空。程序不会自动创建 Store。
+新版不使用 `SECRETS_STORE_ID`。如果一键部署页面仍显示它，说明 GitHub 源仓库尚未更新到新版；先更新仓库再重新进入部署向导。已有部署中的同名变量可删除。
 
 **后续修改这些变量应同步修改 `wrangler.jsonc` 并重新构建部署。** 只在控制台改普通变量，下次从仓库部署时可能被文件中的值覆盖。D1 / KV 绑定也以该文件为准。
 
@@ -53,14 +51,14 @@
 | 名称 | 是否需要 | 内容 / 权限 |
 | --- | --- | --- |
 | `ADMIN_TOKEN` | 必需 | 控制台登录令牌，至少 32 字符 |
-| `ENCRYPTION_KEY` | 必需 | 32 字节随机数据的 Base64 编码，用于加密渠道 Token 覆盖值等凭据 |
-| `CF_API_TOKEN` | 自定义服务商管理及日志分析需要 | 目标账户的 AI Gateway Read / Edit、Account Analytics Read；上传供应商密钥还需 Secrets Store Edit |
+| `ENCRYPTION_KEY` | 必需 | 32 字节随机数据的 Base64 编码，用于加密 D1 中的供应商 API Key、渠道 Token 覆盖值 |
+| `CF_API_TOKEN` | 自定义服务商管理及日志分析需要 | 目标账户的 AI Gateway Read / Edit、Account Analytics Read |
 | `CF_AIG_TOKEN` | 可选 | 独立推理 Token，要求 AI Gateway Run；留空时推理使用 `CF_API_TOKEN`，后者必须额外具备 Run |
 | `CF_AI_TOKEN` | 可选 | 仅 Cloudflare AI REST / 统一计费渠道需要，要求 Workers AI Read；只用自定义服务商可不填 |
 
-第一次使用，最方便的是给 `CF_API_TOKEN` 配齐 **AI Gateway Read / Edit / Run、Account Analytics Read、Secrets Store Edit**，不填写两个可选 Token。已有 BYOK 别名无需本程序操作 Secrets Store 时，可以省去 Secrets Store 权限。
+第一次使用，给 `CF_API_TOKEN` 配齐 **AI Gateway Read / Edit / Run、Account Analytics Read**，即可不填写两个可选 Token。无需 Secrets Store 权限。
 
-这里的 Cloudflare Token 和供应商 API Key 是两种凭据：前者访问 Cloudflare，后者在控制台添加渠道时填写，由程序存入 Cloudflare BYOK。自定义服务商的网关认证使用 `cf-aig-authorization`；AI Gateway 的 Run 权限用于推理认证。[网关认证说明](https://developers.cloudflare.com/ai-gateway/configuration/authentication/)
+这里的 Cloudflare Token 和供应商 API Key 是两种凭据：前者访问 Cloudflare，后者在控制台添加渠道时填写，由程序加密存入 D1。自定义服务商的网关认证使用 `cf-aig-authorization`；AI Gateway 的 Run 权限用于推理认证。[网关认证说明](https://developers.cloudflare.com/ai-gateway/configuration/authentication/)
 
 在本机分别生成管理员令牌和加密密钥，并保存到密码管理器：
 
@@ -168,13 +166,13 @@ README 顶部已提供一键部署按钮，也可以直接点击这里，使用�
 1. 登录 Cloudflare，选择账户，并授权 GitHub。
 2. 将源代码复制到自己账号下的新仓库，选择 Worker / 资源名称。
 3. 确认创建 D1 和 KV。Cloudflare 会将新资源 ID 写入新仓库的 Wrangler 配置。
-4. 填写 Account ID、Gateway ID、Store ID，以及 `ADMIN_TOKEN`、`ENCRYPTION_KEY`、`CF_API_TOKEN`。
+4. 填写 Account ID、Gateway ID，以及 `ADMIN_TOKEN`、`ENCRYPTION_KEY`、`CF_API_TOKEN`。
 5. 检查构建命令为 `npm run build`，部署命令为 `npm run deploy:ci`；确认部署 Token 有 D1 Edit 权限。
 6. 完成部署，再按第 6 节登录并添加自定义服务商。
 
 仓库已提供 `.dev.vars.example` 声明核心 Secrets，以及 `package.json` 的 `cloudflare.bindings` 字段说明。可选的 `CF_AIG_TOKEN` / `CF_AI_TOKEN` 按需在 Worker 运行时 Secrets 中添加。
 
-一键流程负责部署应用、创建 D1 / KV；它不会根据本仓库的字符串变量创建你所需的 AI Gateway / BYOK Store，也不会替你生成可访问模型服务商的凭据。因此应先完成第 2 节的准备。使用私有仓库自用部署时，走第 3 节的 GitHub 连接方式。[按钮的资源配置与公开仓库要求](https://developers.cloudflare.com/workers/platform/deploy-buttons/)
+一键流程负责部署应用、创建 D1 / KV；它不会根据本仓库的字符串变量创建你指定的 AI Gateway，也不会替你生成模型服务商的凭据。因此应先完成第 2 节的准备。使用私有仓库自用部署时，走第 3 节的 GitHub 连接方式。[按钮的资源配置与公开仓库要求](https://developers.cloudflare.com/workers/platform/deploy-buttons/)
 
 ## 5. 方式三：本地命令行部署
 
@@ -253,7 +251,7 @@ curl -fsS "$EDGEGATE_URL/api/health"
 
 1. 在「渠道管理」添加渠道，选择「自定义服务商 · AI Gateway」。
 2. 创建或关联 Cloudflare 服务商，选择 OpenAI Chat Completions 或 Anthropic Messages 协议。
-3. 填写供应商 API Key 或已有 BYOK 别名，设置 Base URL 和请求路径。
+3. 默认选择「程序加密存储」，填写供应商 API Key，设置 Base URL 和请求路径；无需 Secrets Store。已有 BYOK 配置可选择别名模式继续使用。
 4. 填写服务商标签与实际支持的模型清单，保存并启用。
 5. 在「API 密钥」创建应用密钥，选择需要允许的标签，保存生成的 `eg_...` 密钥。
 
@@ -299,7 +297,8 @@ curl -sS "$EDGEGATE_URL/v1/messages" \
 - **本地更新**：依赖变化后执行 `npm ci`，检查通过后执行 `npm run deploy`。
 - **数据库升级**：新增编号递增的 SQL 迁移，不修改已经执行的旧迁移；迁移记录保存在 D1，重复部署只执行未应用的文件。[D1 迁移说明](https://developers.cloudflare.com/d1/reference/migrations/)
 - **备份与回滚**：涉及数据变更前备份 D1 或确认可用的恢复点。Worker 代码回滚不会撤销已经执行的 D1 迁移。
-- **保留凭据**：后续部署保持原 `ENCRYPTION_KEY`。如果仍有用它加密的渠道 Token 或待迁移旧密钥，直接换值会导致无法解密；应先完成凭据重新配置。更换 `ADMIN_TOKEN` 会使已有管理会话失效。
+- **保留凭据**：后续部署保持原 `ENCRYPTION_KEY`。直接换值会导致已保存的供应商 API Key 和渠道 Token 无法解密；应先完成凭据重新配置。备份恢复 D1 时同样需要对应的加密主密钥。更换 `ADMIN_TOKEN` 会使已有管理会话失效。
+- **旧 BYOK 渠道**：升级后继续使用原别名。改为程序存储时，在编辑渠道中选择「程序加密存储」并重新输入供应商 API Key；原 Cloudflare BYOK 不会被删除。本次变更复用已有数据库字段，无需新增迁移。
 - **自定义域名**：在 Worker 的 Settings → Domains & Routes 添加 Custom Domain，按控制台引导配置；保留同域的前端与 API 访问方式。
 - **本地数据**：本地 D1 / KV 与线上独立，本地渠道和应用密钥不会随代码发布。若指向相同 Cloudflare Account / Gateway，云端服务商、BYOK 和日志仍是共享资源。
 - **分支预览**：先使用生产分支构建即可。若启用其他分支预览，不要直接套用生产 `deploy:ci`；为测试环境单独配置 Worker、D1 / KV 和网关。默认版本预览不会自动隔离本项目的数据绑定。
@@ -315,8 +314,10 @@ curl -sS "$EDGEGATE_URL/v1/messages" \
 | 登录提示 `setup_required` | 在 Worker 运行时 Secrets 设置至少 32 字符 `ADMIN_TOKEN` 并部署保存 |
 | 已在 Build 页面填 Token，程序仍提示缺少配置 | 将程序需要的值配置到 Worker 运行时 Variables & Secrets |
 | Cloudflare 服务商 / 日志 / 分析返回 401 或 403 | 检查运行时 `CF_API_TOKEN`、账户范围和相应 AI Gateway / Analytics 权限 |
-| 上传供应商密钥失败 | 检查 Secrets Store 是否存在、Store ID 及 Secrets Store Edit 权限 |
-| 推理被 Cloudflare 拒绝 | 检查 `CF_AIG_TOKEN` 或回退的 `CF_API_TOKEN` 是否具备 AI Gateway Run，以及网关和 BYOK 配置 |
+| 保存供应商密钥提示 `encryption_setup_required` | 检查运行时 `ENCRYPTION_KEY` 是否为 32 字节随机数据的 Base64 编码，并已部署生效 |
+| 编辑渠道要求重新输入密钥 | 更换服务商或请求地址时必须重新填写；普通编辑留空会保留原来的密钥 |
+| 推理被 Cloudflare 拒绝 | 检查 `CF_AIG_TOKEN` 或回退的 `CF_API_TOKEN` 是否具备 AI Gateway Run，以及网关认证配置 |
+| 供应商返回认证失败 | 检查渠道 API Key 和服务商协议；已有 BYOK 模式检查相应别名配置 |
 | `/v1/models` 为空或少模型 | 检查应用密钥的标签和模型白名单，以及渠道、模型、路由的启用状态 |
 | 上游返回 404 | 检查 Base URL 与路径是否重复 `/v1`，及模型名是否为供应商实际支持的 ID |
 | 页面白屏或 API 返回 HTML | 确认部署的是完整 Worker 构建；保留 `assets.run_worker_first` 中的 `/api/*`、`/v1/*`；检查浏览器控制台与 Worker 日志 |

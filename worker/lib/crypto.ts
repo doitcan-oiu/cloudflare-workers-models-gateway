@@ -12,6 +12,9 @@ export async function constantTimeEqual(a: string, b: string): Promise<boolean> 
   for (let i = 0; i < left.length; i++) diff |= left.charCodeAt(i) ^ right.charCodeAt(i);
   return diff === 0;
 }
+export function encryptionConfigured(value: string | undefined) {
+  try { return !!value && atob(value).length === 32; } catch { return false; }
+}
 async function encryptionKey(value: string | undefined) {
   if (!value) throw new Error('ENCRYPTION_KEY is not configured');
   const bytes = Uint8Array.from(atob(value), c => c.charCodeAt(0));

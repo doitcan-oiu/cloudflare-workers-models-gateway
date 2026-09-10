@@ -6,7 +6,8 @@ import { Miniflare, convertV4MiniflareOptions, Response as MFResponse, type Requ
 import { decryptSecret, encryptSecret } from '../worker/lib/crypto';
 import { orderCandidates } from '../worker/upstream';
 import { safeBaseUrl } from '../worker/lib/validation';
-import type { Candidate } from '../worker/types';
+import type { Candidate, Channel, Env } from '../worker/types';
+import worker from '../worker/index';
 
 const ADMIN = 'test-admin-token-with-at-least-32-characters';
 const ENCRYPTION = btoa('12345678901234567890123456789012');
@@ -19,8 +20,6 @@ let mf: Miniflare, db: Awaited<ReturnType<Miniflare['getD1Database']>>, cookie =
 let upstream: (request: MFRequest) => Promise<MFResponse> | MFResponse;
 let calls: Recorded[], controlCalls: Recorded[], providers: Map<string, Provider>, remoteLogs: RemoteLog[];
 let controlFailure = 0, graphqlFailure = false;
-let storesAvailable = true, associationFailure = false;
-let storedSecrets: Map<string, { id: string; name: string; value: string; scopes: string[] }>;
 const ok = (result: unknown, info?: unknown) => MFResponse.json({ success: true, result, ...(info ? { result_info: info } : {}) });
 const fail = (status: number) => MFResponse.json({ success: false, errors: [{ message: 'sensitive Cloudflare response' }] }, { status });
 
@@ -30,12 +29,8 @@ async function outbound(req: MFRequest): Promise<MFResponse> {
   if (url.hostname === 'api.cloudflare.com' && !url.pathname.includes('/ai/v1/')) {
     controlCalls.push(record);
     if (controlFailure) return fail(controlFailure);
-    if (url.pathname.endsWith('/secrets_store/stores')) return ok(storesAvailable ? [{ id: 'b'.repeat(32) }] : []);
-    if (url.pathname.endsWith('/secrets') && req.method === 'POST') {
-      if (!Array.isArray(body)) return fail(400);
-      const secret = { ...body[0], id: crypto.randomUUID() };
-      storedSecrets.set(secret.id, secret); return ok([{ id: secret.id, name: secret.name, status: 'pending' }]);
-    }
+    // This account has no Secrets Store permissions; custom keys must stay in D1.
+    if (url.pathname.includes('/secrets_store/') || url.pathname.endsWith('/provider_configs')) return fail(403);
     if (url.pathname.endsWith('/graphql')) {
       if (graphqlFailure) return MFResponse.json({ errors: [{ message: 'no analytics permissions' }], data: null });
       if (String(body.query).includes('__type')) return MFResponse.json({ data: { sum: { fields: ['tokensIn', 'tokensOut', 'cost', 'erroredRequests', 'cachedRequests'].map(name => ({ name })) } } });
@@ -58,12 +53,6 @@ async function outbound(req: MFRequest): Promise<MFResponse> {
       if (req.method === 'PATCH') { Object.assign(provider, body); return ok(provider); }
       if (req.method === 'DELETE') providers.delete(id);
       return ok(provider);
-    }
-    if (url.pathname.endsWith('/provider_configs') && req.method === 'POST') {
-      if (associationFailure) return fail(403);
-      const secret = storedSecrets.get(String(body.secret_id));
-      if (!secret || secret.name !== `test-gateway_${body.provider_slug}_${body.alias}` || !secret.scopes.includes('ai_gateway')) return fail(400);
-      return ok({ id: crypto.randomUUID(), alias: body.alias, provider_slug: body.provider_slug, secret_preview: 'redacted' });
     }
     if (url.pathname === `${root}/gateways/test-gateway/logs`) {
       let rows = remoteLogs;
@@ -115,7 +104,6 @@ beforeAll(async () => {
 });
 beforeEach(async () => {
   calls = []; controlCalls = []; providers = new Map(); remoteLogs = []; controlFailure = 0; graphqlFailure = false;
-  storedSecrets = new Map(); storesAvailable = true; associationFailure = false;
   upstream = () => MFResponse.json(completion);
   await db.batch(['provider_profiles', 'request_logs', 'key_counters', 'api_keys', 'routes', 'models', 'channels'].map(table => db.prepare(`DELETE FROM ${table}`)));
   const response = await request('/api/auth/login', { body: { token: ADMIN } }); expect(response.status).toBe(200);
@@ -171,18 +159,21 @@ describe('access control', () => {
   });
 });
 
-describe('Cloudflare custom providers and BYOK', () => {
-  it('creates a real API provider configuration and delegates the key to Cloudflare', async () => {
+describe('Cloudflare custom providers and encrypted credentials', () => {
+  it('creates a Cloudflare provider and encrypts its key in D1 without Secrets Store access', async () => {
     const providerCall = controlCalls.find(c => c.url.endsWith('/custom-providers'))!;
     expect(providerCall.body).toMatchObject({ name: 'Primary', slug: 'primary', base_url: 'https://primary.example.com', enable: true });
-    const credentialCall = controlCalls.find(c => c.url.endsWith('/provider_configs'))!;
-    expect(credentialCall.body).toMatchObject({ provider_slug: 'custom-primary', default_config: false });
-    expect(credentialCall.body).not.toHaveProperty('secret');
-    expect(storedSecrets.get(String(credentialCall.body.secret_id))).toMatchObject({ value: 'provider-secret', name: `test-gateway_custom-primary_${credentialCall.body.alias}`, scopes: ['ai_gateway'] });
-    expect(credentialCall.headers.authorization).toBe('Bearer cf-control-token');
-    const local = await db.prepare('SELECT * FROM channels LIMIT 1').first();
-    expect(local).toMatchObject({ secret_encrypted: null, provider_slug: 'primary', gateway_path: 'v1/chat/completions' });
+    expect(providerCall.headers.authorization).toBe('Bearer cf-control-token');
+    expect(controlCalls.some(c => /secrets_store|provider_configs/.test(c.url))).toBe(false);
+    expect(JSON.stringify(controlCalls)).not.toContain('provider-secret');
+    const local = (await db.prepare('SELECT * FROM channels LIMIT 1').first<Channel>())!;
+    expect(local).toMatchObject({ byok_alias: '', provider_slug: 'primary', gateway_path: 'v1/chat/completions' });
+    expect(await decryptSecret(local.secret_encrypted!, ENCRYPTION, local.id)).toBe('provider-secret');
+    await expect(decryptSecret(local.secret_encrypted!, ENCRYPTION, 'another-channel')).rejects.toThrow();
     expect(JSON.stringify(local)).not.toContain('provider-secret');
+    const exposed = (await admin<Record<string, unknown>[]>('/channels'))[0];
+    expect(exposed).toMatchObject({ has_secret: true, configured: true });
+    expect(exposed).not.toHaveProperty('secret_encrypted');
   });
   it('links an existing account provider without creating or overwriting it', async () => {
     const existing = [...providers.values()][0], before = controlCalls.length;
@@ -215,13 +206,15 @@ describe('Cloudflare custom providers and BYOK', () => {
     await db.prepare('UPDATE channels SET provider_id = NULL, provider_slug = NULL, byok_alias = ?').bind('').run();
     expect((await chat((await key()).key)).status).toBe(503); expect(calls).toHaveLength(0);
   });
-  it('migrates a legacy provider secret into BYOK only for the same destination', async () => {
+  it('retains a legacy encrypted key when linking the same destination to AI Gateway', async () => {
     const current = await db.prepare('SELECT * FROM channels LIMIT 1').first<{ id: string; provider_id: string }>();
     const encrypted = await encryptSecret('legacy-secret', ENCRYPTION, current!.id);
     await db.prepare('UPDATE channels SET provider_id = NULL, provider_slug = NULL, byok_alias = ?, base_url = ?, secret_encrypted = ? WHERE id = ?').bind('', 'https://primary.example.com/v1', encrypted, current!.id).run();
     await admin(`/channels/${current!.id}`, { name: 'Migrated', kind: 'openai', provider_id: current!.provider_id, gateway_path: 'v1/chat/completions' }, 'PUT');
-    expect([...storedSecrets.values()].some(s => s.value === 'legacy-secret' && s.name.startsWith('test-gateway_custom-primary_'))).toBe(true);
-    expect(await db.prepare('SELECT secret_encrypted FROM channels WHERE id = ?').bind(current!.id).first()).toMatchObject({ secret_encrypted: null });
+    expect(await db.prepare('SELECT secret_encrypted FROM channels WHERE id = ?').bind(current!.id).first()).toMatchObject({ secret_encrypted: encrypted });
+    expect((await chat((await key()).key)).status).toBe(200);
+    expect(calls[0].headers.authorization).toBe('Bearer legacy-secret');
+    expect(controlCalls.some(c => /secrets_store|provider_configs/.test(c.url))).toBe(false);
   });
   it('surfaces Cloudflare permission failures without saving a misleading local channel', async () => {
     controlFailure = 403;
@@ -229,19 +222,66 @@ describe('Cloudflare custom providers and BYOK', () => {
     expect(response.status).toBe(502); const data = await response.text(); expect(data).toContain('cloudflare_permission_denied'); expect(data).not.toContain('sensitive Cloudflare response');
     expect(await db.prepare("SELECT COUNT(*) AS n FROM channels WHERE name = 'Denied'").first()).toMatchObject({ n: 0 });
   });
-  it('reports missing Secrets Store and allows using an existing BYOK alias', async () => {
-    storesAvailable = false;
-    const provider = [...providers.values()][0];
-    const response = await request('/api/channels', { admin: true, body: { name: 'New key', kind: 'openai', provider_id: provider.id, secret: 'new-secret' } });
-    expect(response.status).toBe(503); expect(await response.text()).toContain('secrets_store_setup_required');
-    await admin('/channels', { name: 'Existing alias', kind: 'openai', provider_id: provider.id, byok_alias: 'production' });
+  it('preserves encrypted keys on edits and rotates them without returning either key', async () => {
+    const current = (await db.prepare('SELECT * FROM channels LIMIT 1').first<Channel>())!;
+    await admin(`/channels/${current.id}`, { name: 'Renamed', kind: 'openai', provider_id: current.provider_id, credential_mode: 'local' }, 'PUT');
+    expect(await db.prepare('SELECT secret_encrypted FROM channels WHERE id = ?').bind(current.id).first()).toMatchObject({ secret_encrypted: current.secret_encrypted });
+    await admin(`/channels/${current.id}`, { name: 'Rotated', kind: 'openai', provider_id: current.provider_id, secret: 'new-provider-key' }, 'PUT');
+    const rotated = (await db.prepare('SELECT * FROM channels WHERE id = ?').bind(current.id).first<Channel>())!;
+    expect(rotated.secret_encrypted).not.toBe(current.secret_encrypted);
+    expect(await decryptSecret(rotated.secret_encrypted!, ENCRYPTION, current.id)).toBe('new-provider-key');
+    expect(JSON.stringify(await admin('/channels'))).not.toMatch(/provider-secret|new-provider-key|secret_encrypted/);
+    expect((await chat((await key()).key)).status).toBe(200);
+    expect(calls[0].headers.authorization).toBe('Bearer new-provider-key');
   });
-  it('provides recoverable context if provider association fails after secret creation', async () => {
-    associationFailure = true;
-    const response = await request('/api/channels', { admin: true, body: { name: 'Failure', kind: 'openai', provider_id: [...providers.values()][0].id, secret: 'never-echo-this-key' } });
-    expect(response.status).toBe(502); const message = await response.text();
-    expect(message).toContain('byok_association_failed'); expect(message).toContain('test-gateway_custom-primary_edgegate-'); expect(message).not.toContain('never-echo-this-key');
-    expect(await db.prepare("SELECT COUNT(*) AS n FROM channels WHERE name = 'Failure'").first()).toMatchObject({ n: 0 });
+  it('keeps existing BYOK channels working and explicitly switches between credential modes', async () => {
+    const current = (await db.prepare('SELECT * FROM channels LIMIT 1').first<Channel>())!;
+    await admin(`/channels/${current.id}`, { name: 'BYOK', kind: 'openai', provider_id: current.provider_id, credential_mode: 'byok', byok_alias: 'production' }, 'PUT');
+    expect(await db.prepare('SELECT secret_encrypted, byok_alias FROM channels WHERE id = ?').bind(current.id).first()).toEqual({ secret_encrypted: null, byok_alias: 'production' });
+    // Older clients can edit metadata without submitting a credential mode.
+    await admin(`/channels/${current.id}`, { name: 'BYOK renamed', kind: 'openai', provider_id: current.provider_id }, 'PUT');
+    const token = (await key()).key;
+    expect((await chat(token)).status).toBe(200);
+    expect(calls[0].headers['cf-aig-byok-alias']).toBe('production');
+    expect(calls[0].headers.authorization).toBeUndefined(); expect(calls[0].headers['x-api-key']).toBeUndefined();
+    const missing = await request(`/api/channels/${current.id}`, { method: 'PUT', admin: true, body: { name: 'Local', kind: 'openai', provider_id: current.provider_id, credential_mode: 'local' } });
+    expect(missing.status).toBe(400);
+    await admin(`/channels/${current.id}`, { name: 'Local', kind: 'openai', provider_id: current.provider_id, credential_mode: 'local', secret: 'local-key' }, 'PUT');
+    expect((await chat(token)).status).toBe(200);
+    expect(calls[1].headers.authorization).toBe('Bearer local-key');
+    expect(calls[1].headers['cf-aig-byok-alias']).toBeUndefined();
+    expect(await db.prepare('SELECT byok_alias FROM channels WHERE id = ?').bind(current.id).first()).toEqual({ byok_alias: '' });
+    expect(controlCalls.some(c => /secrets_store|provider_configs/.test(c.url))).toBe(false);
+  });
+  it.each(['provider', 'path', 'base_url', 'legacy'])('does not reuse a saved key after a %s destination change', async change => {
+    const current = (await db.prepare('SELECT * FROM channels LIMIT 1').first<Channel>())!;
+    const body = { name: 'Changed', kind: 'openai', provider_id: current.provider_id!, gateway_path: current.gateway_path };
+    if (change === 'provider') {
+      const other = { id: crypto.randomUUID(), name: 'Other', slug: 'other', base_url: current.base_url, enable: true };
+      providers.set(other.id, other); body.provider_id = other.id;
+    } else if (change === 'path') body.gateway_path = 'different/chat/completions';
+    else if (change === 'base_url') providers.get(current.provider_id!)!.base_url = 'https://changed.example.com';
+    else await db.prepare('UPDATE channels SET provider_id = NULL, provider_slug = NULL, base_url = ? WHERE id = ?').bind('https://other.example.com/v1', current.id).run();
+    const response = await request(`/api/channels/${current.id}`, { method: 'PUT', admin: true, body });
+    expect(response.status).toBe(400); expect(await response.text()).not.toContain('provider-secret');
+    expect(await db.prepare('SELECT secret_encrypted FROM channels WHERE id = ?').bind(current.id).first()).toMatchObject({ secret_encrypted: current.secret_encrypted });
+    expect(calls).toHaveLength(0);
+  });
+  it.each([undefined, 'invalid-base64', btoa('short')])('rejects new keys before Cloudflare writes with invalid encryption configuration %s', async encryption => {
+    const before = controlCalls.length;
+    const response = await worker.fetch(new Request('https://edgegate.example/api/channels', { method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Invalid encryption', kind: 'openai', provider_slug: 'invalid-encryption', base_url: 'https://invalid-encryption.example.com', secret: 'never-echo-this-key' }) }), {
+      DB: db, KV: await mf.getKVNamespace('KV'), ADMIN_TOKEN: ADMIN, ENCRYPTION_KEY: encryption, CLOUDFLARE_ACCOUNT_ID: account, CF_API_TOKEN: 'cf-control-token',
+    } as unknown as Env);
+    expect(response.status).toBe(503); const message = await response.text();
+    expect(message).toContain('encryption_setup_required'); expect(message).not.toContain('never-echo-this-key');
+    expect(controlCalls).toHaveLength(before);
+    expect(await db.prepare("SELECT COUNT(*) AS n FROM channels WHERE name = 'Invalid encryption'").first()).toMatchObject({ n: 0 });
+  });
+  it('does not reinterpret a Cloudflare token override as a provider key when changing channel kind', async () => {
+    const native = await admin<{ id: string }>('/channels', { name: 'Native', kind: 'cloudflare', secret: 'cf-override' });
+    const response = await request(`/api/channels/${native.id}`, { method: 'PUT', admin: true, body: { name: 'Custom', kind: 'openai', provider_id: [...providers.values()][0].id } });
+    expect(response.status).toBe(400);
+    expect(await db.prepare('SELECT kind FROM channels WHERE id = ?').bind(native.id).first()).toEqual({ kind: 'cloudflare' });
   });
 });
 
@@ -251,12 +291,13 @@ describe('AI Gateway inference', () => {
     expect(response.status).toBe(200); expect(await response.json()).toEqual(completion);
     expect(calls[0].url).toBe(`https://gateway.ai.cloudflare.com/v1/${account}/test-gateway/custom-primary/v1/chat/completions`);
     expect(calls[0].headers['cf-aig-authorization']).toBe('Bearer cf-inference-token');
-    expect(calls[0].headers['cf-aig-byok-alias']).toMatch(/^edgegate-/);
-    expect(calls[0].headers.authorization).toBeUndefined();
+    expect(calls[0].headers['cf-aig-byok-alias']).toBeUndefined();
+    expect(calls[0].headers.authorization).toBe('Bearer provider-secret');
     expect(calls[0].headers['cf-aig-collect-log']).toBeUndefined(); expect(calls[0].headers['cf-aig-skip-cache']).toBeUndefined();
     expect(calls[0].body).toMatchObject({ model: 'upstream-test', response_format: { type: 'json_object' } });
     expect(JSON.parse(calls[0].headers['cf-aig-metadata'])).toMatchObject({ request_id: response.headers.get('X-Request-ID'), key_id: created.id, key_name: 'Test app', model_alias: 'test-model', attempt: '1' });
-    expect(response.headers.get('cf-aig-log-id')).toBe('cf-log-1'); expect(JSON.stringify(calls)).not.toContain(created.key); expect(JSON.stringify(calls)).not.toContain('provider-secret');
+    expect(response.headers.get('cf-aig-log-id')).toBe('cf-log-1'); expect(JSON.stringify(calls)).not.toContain(created.key);
+    expect(JSON.stringify(calls[0].body)).not.toContain('provider-secret'); expect(calls[0].headers['cf-aig-metadata']).not.toContain('provider-secret');
     expect(await db.prepare('SELECT COUNT(*) AS n FROM request_logs').first()).toMatchObject({ n: 0 });
   });
   it('preserves provider path prefixes without adding a duplicate version', async () => {
@@ -340,13 +381,13 @@ describe('Cloudflare logs and analytics as the source of truth', () => {
 });
 
 describe('local crypto and routing rules', () => {
-  it('binds retained encrypted Cloudflare token overrides to a channel', async () => { const value = await encryptSecret('secret', ENCRYPTION, 'a'); expect(await decryptSecret(value, ENCRYPTION, 'a')).toBe('secret'); await expect(decryptSecret(value, ENCRYPTION, 'b')).rejects.toThrow(); });
+  it('binds encrypted credentials to a channel', async () => { const value = await encryptSecret('secret', ENCRYPTION, 'a'); expect(await decryptSecret(value, ENCRYPTION, 'a')).toBe('secret'); await expect(decryptSecret(value, ENCRYPTION, 'b')).rejects.toThrow(); });
   it('orders priorities and weights without duplicate attempts', () => { const values = [{ id: 'a', priority: 0, weight: 1 }, { id: 'b', priority: 0, weight: 9 }, { id: 'c', priority: 1, weight: 1000 }] as Candidate[]; expect(orderCandidates(values, () => 0.5).map(c => c.id)).toEqual(['b', 'a', 'c']); });
   it.each(['http://api.example.com', 'https://127.0.0.1', 'https://[::1]', 'https://localhost', 'https://a.local', 'https://user:pass@api.example.com', 'https://api.example.com:8443', 'https://api.example.com?secret=x'])('rejects unsafe provider URL %s', url => { expect(() => safeBaseUrl(url)).toThrow(); });
 });
 
 async function catalog(name: string, protocol: 'openai' | 'anthropic', tags: string[], models: string[]) {
-  const created = await admin<{ id: string }>('/channels', { name, kind: 'openai', provider_slug: name.toLowerCase(), base_url: `https://${name.toLowerCase()}.example.com`, byok_alias: 'existing', protocol, tags, models });
+  const created = await admin<{ id: string }>('/channels', { name, kind: 'openai', provider_slug: name.toLowerCase(), base_url: `https://${name.toLowerCase()}.example.com`, secret: `${name.toLowerCase()}-provider-key`, protocol, tags, models });
   const local = await db.prepare('SELECT provider_id FROM channels WHERE id = ?').bind(created.id).first<{ provider_id: string }>();
   return { channelId: created.id, provider: providers.get(local!.provider_id)! };
 }
@@ -458,6 +499,9 @@ describe('dual API endpoints through Cloudflare AI Gateway', () => {
     expect(calls[0].url).toBe(`https://gateway.ai.cloudflare.com/v1/${account}/test-gateway/custom-anthropic/v1/messages`);
     expect(calls[0].body).toMatchObject({ max_tokens: 1024, system: [{ type: 'text', text: '规则' }], messages: [{ role: 'user', content: [{ type: 'text', text: '你好' }] }] });
     expect(calls[0].headers['anthropic-version']).toBe('2023-06-01');
+    expect(calls[0].headers['x-api-key']).toBe('anthropic-provider-key');
+    expect(calls[0].headers.authorization).toBeUndefined(); expect(calls[0].headers['cf-aig-byok-alias']).toBeUndefined();
+    expect(calls[0].headers['cf-aig-authorization']).toBe('Bearer cf-inference-token');
     expect(JSON.stringify(calls)).not.toContain(token);
   });
   it('accepts x-api-key on /v1/messages and converts requests to OpenAI', async () => {
@@ -466,6 +510,7 @@ describe('dual API endpoints through Cloudflare AI Gateway', () => {
     expect(calls[0].url).toContain('/custom-primary/v1/chat/completions');
     expect(calls[0].body).toMatchObject({ messages: [{ role: 'system', content: '规则' }, { role: 'user', content: '你好' }], max_tokens: 100, stop: ['END'] });
     expect(calls[0].headers['x-api-key']).toBeUndefined(); expect(calls[0].headers['anthropic-version']).toBeUndefined();
+    expect(calls[0].headers.authorization).toBe('Bearer provider-secret');
   });
   it('keeps Anthropic-native extensions and beta headers on matching routes', async () => {
     await catalog('Anthropic', 'anthropic', ['claude'], ['sonnet']);
@@ -484,6 +529,8 @@ describe('dual API endpoints through Cloudflare AI Gateway', () => {
     expect(calls[0].body.system).toEqual([{ type: 'text', text: 'rule' }]);
     expect(calls[1].body.messages).toEqual([{ role: 'system', content: 'rule' }, { role: 'user', content: 'question' }]);
     expect(calls[1].body).not.toHaveProperty('system'); expect(response.headers.get('X-Gateway-Attempts')).toBe('2');
+    expect(calls[0].headers['x-api-key']).toBe('anthropic-provider-key'); expect(calls[0].headers.authorization).toBeUndefined();
+    expect(calls[1].headers.authorization).toBe('Bearer compatible-provider-key'); expect(calls[1].headers['x-api-key']).toBeUndefined();
     expect(a.channelId).not.toBe(b.channelId);
   });
   it('skips a protocol-incompatible route and returns a clear error if no route can translate', async () => {

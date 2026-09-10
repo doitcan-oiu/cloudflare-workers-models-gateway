@@ -23,6 +23,7 @@ export const channelSchema = z.object({
   kind: z.enum(['cloudflare', 'ai-gateway', 'openai']),
   base_url: z.string().max(500).default(''),
   secret: z.string().trim().max(4096).optional(),
+  credential_mode: z.enum(['local', 'byok']).optional(),
   enabled: z.boolean().default(true),
   timeout_ms: z.number().int().min(1000).max(120000).default(60000),
   provider_id: z.string().max(100).optional(),

@@ -1,11 +1,11 @@
 import { Hono } from 'hono';
 import type { AppEnv, Channel, Env } from './types';
 import { ApiError, invalid } from './lib/errors';
-import { decryptSecret, encryptSecret, randomToken } from './lib/crypto';
+import { encryptionConfigured, encryptSecret, randomToken } from './lib/crypto';
 import { channelSchema, providerSchema, safeBaseUrl } from './lib/validation';
 import { channelConfigured } from './upstream';
 import { profile, profiles, saveProfile, syncCatalog } from './providers';
-import { cfApi, providerPath, publicProvider, storeByok, type CustomProvider } from './cloudflare';
+import { cfApi, providerPath, publicProvider, type CustomProvider } from './cloudflare';
 
 export const channels = new Hono<AppEnv>();
 channels.get('/providers', async c => {
@@ -44,10 +44,20 @@ channels.delete('/providers/:id', async c => {
 });
 
 type ChannelData = ReturnType<typeof channelSchema.parse>;
-async function resolveCustom(env: Env, data: ChannelData, previous?: Channel) {
-  if (!data.secret && !data.byok_alias && !previous?.byok_alias && !(previous?.kind === 'openai' && !previous.provider_id && previous.secret_encrypted)) {
+async function encryptChannelSecret(env: Env, secret: string, id: string) {
+  if (!encryptionConfigured(env.ENCRYPTION_KEY)) throw new ApiError(503, 'encryption_setup_required', '请配置有效的 ENCRYPTION_KEY：32 字节随机数据的 Base64 编码');
+  return encryptSecret(secret, env.ENCRYPTION_KEY, id);
+}
+async function resolveCustom(env: Env, data: ChannelData, id: string, previous?: Channel) {
+  const previousCustom = previous?.kind === 'openai' ? previous : undefined;
+  // Requests from older clients infer the credential mode; new forms choose it explicitly.
+  const mode = data.credential_mode || (data.secret ? 'local' : data.byok_alias ? 'byok' : previousCustom?.secret_encrypted ? 'local' : previousCustom?.byok_alias ? 'byok' : 'local');
+  if (mode === 'byok' && data.secret) throw invalid('使用已有 BYOK 别名时无需填写 API Key；请切换为程序加密存储后保存新密钥');
+  if (!data.secret && !data.byok_alias && !previousCustom?.byok_alias && !previousCustom?.secret_encrypted) {
     throw invalid('请提供供应商 API Key 或已存在的 Cloudflare BYOK 别名');
   }
+  // Validate encryption before creating any account-level provider resources.
+  const newEncrypted = data.secret ? await encryptChannelSecret(env, data.secret, id) : null;
   let provider: CustomProvider;
   if (data.provider_id) {
     provider = (await cfApi<CustomProvider>(env, `${providerPath(env)}/${encodeURIComponent(data.provider_id)}`)).result;
@@ -61,23 +71,18 @@ async function resolveCustom(env: Env, data: ChannelData, previous?: Channel) {
   if (!exists) await saveProfile(env, provider.id, data);
   const existingProfile = await profile(env, provider.id);
   const defaultPath = `${new URL(provider.base_url).pathname.replace(/\/+$/, '').endsWith('/v1') ? '' : 'v1/'}${existingProfile.protocol === 'anthropic' ? 'messages' : 'chat/completions'}`;
-  const path = (data.gateway_path || previous?.gateway_path || defaultPath).replace(/^\/+|\/+$/g, '');
+  const path = (data.gateway_path || (previousCustom?.provider_id === provider.id ? previousCustom.gateway_path : '') || defaultPath).replace(/^\/+|\/+$/g, '');
   if (!path) throw invalid('上游请求路径不能为空');
-  let secret = data.secret;
-  const legacyEndpoint = previous?.base_url ? `${previous.base_url}/chat/completions` : '';
-  if (!secret && previous?.kind === 'openai' && !previous.provider_id && previous.secret_encrypted && legacyEndpoint === `${safeBaseUrl(provider.base_url)}/${path}`) {
-    secret = await decryptSecret(previous.secret_encrypted, env.ENCRYPTION_KEY, previous.id);
-  }
-  let alias = data.byok_alias;
-  const sameProvider = previous?.provider_id === provider.id;
-  if (!alias && sameProvider) alias = previous?.byok_alias || '';
-  if (secret) {
-    // Each rotation creates a separate Cloudflare-managed credential; no provider key is stored in D1.
-    alias = `edgegate-${randomToken(9).toLowerCase().replace(/_/g, '-')}`;
-    await storeByok(env, provider.slug, alias, secret);
-  }
-  if (!alias) throw invalid('请提供供应商 API Key 交由 Cloudflare 保管，或填写已存在的 BYOK 别名');
-  return { provider, path, alias };
+  const previousEndpoint = previousCustom?.base_url ? `${safeBaseUrl(previousCustom.base_url)}/${previousCustom.provider_id ? previousCustom.gateway_path : 'chat/completions'}` : '';
+  const sameProvider = !!previousCustom && (!previousCustom.provider_id || (previousCustom.provider_id === provider.id && previousCustom.provider_slug === provider.slug));
+  const sameDestination = sameProvider && previousEndpoint === `${safeBaseUrl(provider.base_url)}/${path}`;
+  // Never silently carry a saved credential across a provider or endpoint change.
+  const encrypted = mode === 'local' ? newEncrypted || (sameDestination ? previousCustom?.secret_encrypted : null) : null;
+  const alias = mode === 'byok' ? data.byok_alias || (sameDestination ? previousCustom?.byok_alias : '') || '' : '';
+  if (!encrypted && !alias) throw invalid(mode === 'local'
+    ? '请填写供应商 API Key；更换服务商或请求地址时需重新输入密钥'
+    : '请填写此服务商在当前 AI Gateway 中已存在的 BYOK 别名');
+  return { provider, path, alias, encrypted };
 }
 channels.get('/channels', async c => {
   const { results } = await c.env.DB.prepare('SELECT * FROM channels ORDER BY created_at DESC').all<Channel>();
@@ -88,13 +93,13 @@ channels.get('/channels', async c => {
 });
 channels.post('/channels', async c => {
   const data = channelSchema.parse(await c.req.json()), id = `ch_${randomToken(12)}`;
-  const custom = data.kind === 'openai' ? await resolveCustom(c.env, data) : null;
-  const encrypted = data.kind !== 'openai' && data.secret ? await encryptSecret(data.secret, c.env.ENCRYPTION_KEY, id) : null;
+  const custom = data.kind === 'openai' ? await resolveCustom(c.env, data, id) : null;
+  const encrypted = custom ? custom.encrypted : data.secret ? await encryptChannelSecret(c.env, data.secret, id) : null;
   try {
     await c.env.DB.prepare('INSERT INTO channels (id, name, kind, base_url, secret_encrypted, enabled, timeout_ms, provider_id, provider_slug, gateway_path, byok_alias) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .bind(id, data.name, data.kind, custom?.provider.base_url || '', encrypted, +data.enabled, data.timeout_ms, custom?.provider.id || null, custom?.provider.slug || null, custom?.path || data.gateway_path || 'chat/completions', custom?.alias || '').run();
   } catch (error) {
-    if (custom) throw new ApiError(503, 'local_save_failed', `Cloudflare 服务商 ${custom.provider.slug} 已准备好，但本地保存失败；请从已有服务商关联，BYOK 别名为 ${custom.alias}`);
+    if (custom) throw new ApiError(503, 'local_save_failed', `Cloudflare 服务商 ${custom.provider.slug} 已准备好，但本地保存失败；请从已有服务商关联并重新填写凭据`);
     throw error;
   }
   if (custom) await syncCatalog(c.env, custom.provider.id);
@@ -105,13 +110,13 @@ channels.put('/channels/:id', async c => {
   const previous = await c.env.DB.prepare('SELECT * FROM channels WHERE id = ?').bind(id).first<Channel>();
   if (!previous) throw new ApiError(404, 'not_found', '渠道不存在');
   const data = channelSchema.parse(await c.req.json());
-  const custom = data.kind === 'openai' ? await resolveCustom(c.env, data, previous) : null;
-  const encrypted = data.kind === 'openai' ? null : data.secret ? await encryptSecret(data.secret, c.env.ENCRYPTION_KEY, id) : data.kind === previous.kind ? previous.secret_encrypted : null;
+  const custom = data.kind === 'openai' ? await resolveCustom(c.env, data, id, previous) : null;
+  const encrypted = custom ? custom.encrypted : data.secret ? await encryptChannelSecret(c.env, data.secret, id) : data.kind === previous.kind ? previous.secret_encrypted : null;
   try {
     await c.env.DB.prepare('UPDATE channels SET name = ?, kind = ?, base_url = ?, secret_encrypted = ?, enabled = ?, timeout_ms = ?, provider_id = ?, provider_slug = ?, gateway_path = ?, byok_alias = ? WHERE id = ?')
       .bind(data.name, data.kind, custom?.provider.base_url || '', encrypted, +data.enabled, data.timeout_ms, custom?.provider.id || null, custom?.provider.slug || null, custom?.path || data.gateway_path || 'chat/completions', custom?.alias || '', id).run();
   } catch (error) {
-    if (custom) throw new ApiError(503, 'local_save_failed', `Cloudflare 配置已准备好，但本地保存失败；服务商 ${custom.provider.slug}，BYOK 别名 ${custom.alias}，请重新关联`);
+    if (custom) throw new ApiError(503, 'local_save_failed', `Cloudflare 服务商 ${custom.provider.slug} 已准备好，但本地保存失败；请重新保存渠道并确认凭据`);
     throw error;
   }
   if (custom) await syncCatalog(c.env, custom.provider.id);

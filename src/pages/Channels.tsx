@@ -18,27 +18,29 @@ function ChannelForm({ channel, onClose }: { channel: Channel | null; onClose: (
   const [providerId, setProviderId] = useState(channel?.provider_id || ''), [slug, setSlug] = useState(channel?.provider_slug || '');
   const [url, setUrl] = useState(channel?.base_url || ''), [path, setPath] = useState(channel?.gateway_path || 'v1/chat/completions');
   const [alias, setAlias] = useState(channel?.byok_alias || ''), [secret, setSecret] = useState('');
+  const [credentialMode, setCredentialMode] = useState(channel?.kind === 'openai' && channel.byok_alias && !channel.has_secret ? 'byok' : 'local');
   const [timeout, setTimeoutValue] = useState((channel?.timeout_ms || 60000) / 1000), [enabled, setEnabled] = useState(channel ? !!channel.enabled : true);
   const [busy, setBusy] = useState(false), [error, setError] = useState('');
   const { refresh } = useContext(RefreshContext), notify = useContext(ToastContext);
   async function submit(e: FormEvent) {
     e.preventDefault(); setBusy(true); setError('');
     try {
-      await api(`/channels${channel ? `/${channel.id}` : ''}`, { method: channel ? 'PUT' : 'POST', body: JSON.stringify({ ...profile, name, kind, base_url: url, secret: secret || undefined, timeout_ms: timeout * 1000, enabled, provider_id: mode === 'existing' ? providerId : undefined, provider_slug: slug || undefined, gateway_path: path, byok_alias: alias }) });
+      await api(`/channels${channel ? `/${channel.id}` : ''}`, { method: channel ? 'PUT' : 'POST', body: JSON.stringify({ ...profile, name, kind, base_url: url, secret: kind !== 'openai' || credentialMode === 'local' ? secret || undefined : undefined, credential_mode: kind === 'openai' ? credentialMode : undefined, timeout_ms: timeout * 1000, enabled, provider_id: mode === 'existing' ? providerId : undefined, provider_slug: slug || undefined, gateway_path: path, byok_alias: kind === 'openai' && credentialMode === 'byok' ? alias : '' }) });
       refresh(); notify(channel ? '渠道已更新' : '渠道已接入 AI Gateway'); onClose();
     } catch (err) { setError((err as Error).message); } finally { setBusy(false); }
   }
   return <Modal title={channel ? '编辑渠道' : '添加 AI Gateway 渠道'} description="所有自定义服务商调用都经过 Cloudflare AI Gateway。" onClose={onClose}><form onSubmit={submit} className="form-stack">
     <FormSection number="01" title="渠道标识"><Field label="本地渠道名称"><Input required maxLength={80} value={name} onChange={e => setName(e.target.value)} placeholder="例如：我的模型服务" autoFocus /></Field>
-    <Field label="接入方式"><Select value={kind} onChange={value => setKind(value as Channel['kind'])}>{Object.entries(channelLabel).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</Select></Field>
+    <Field label="接入方式"><Select value={kind} onChange={value => { setKind(value as Channel['kind']); setSecret(''); }}>{Object.entries(channelLabel).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</Select></Field>
     </FormSection><FormSection number="02" title="上游连接">{kind === 'openai' ? <>
       {!channel?.provider_id && <Field label="服务商来源"><Select value={mode} onChange={value => { setMode(value); setProviderId(''); }}><option value="new">在 Cloudflare 创建新服务商</option><option value="existing">关联已有 Cloudflare 服务商</option></Select></Field>}
       {mode === 'existing' ? <><ProviderPicker selected={providerId} onSelect={provider => { setProviderId(provider.id); setSlug(provider.slug); setUrl(provider.base_url); setProfile({ protocol: provider.protocol, tags: provider.tags, models: provider.models }); setAlias(''); setSecret(''); setPath(`${new URL(provider.base_url).pathname.replace(/\/+$/, '').endsWith('/v1') ? '' : 'v1/'}${provider.protocol === 'anthropic' ? 'messages' : 'chat/completions'}`); }} /><div className="info-note">服务商地址：{url || '选择服务商后显示'}<br />修改账户级服务商信息请使用“Cloudflare 服务商”页签。</div></> : <><Field label="服务商 Slug" hint="在 Cloudflare 账户内唯一，小写字母、数字和短横线；无需添加 custom- 前缀。"><Input required value={slug} pattern="[a-z0-9]+(-[a-z0-9]+)*" onChange={e => setSlug(e.target.value)} placeholder="my-provider" /></Field><Field label="服务商 Base URL" hint="填写根域名或固定路径前缀，下面的请求路径会原样追加。"><Input type="url" required value={url} onChange={e => setUrl(e.target.value)} placeholder="https://api.example.com" /></Field></>}
       <ProviderFields key={`${mode}:${providerId}`} value={profile} readOnly={mode === 'existing'} onChange={value => { if (value.protocol !== profile.protocol) setPath(previous => previous.replace(/(?:chat\/completions|messages)$/, value.protocol === 'anthropic' ? 'messages' : 'chat/completions')); setProfile(value); }} />
       <Field label="推理请求路径" hint="OpenAI 通常为 v1/chat/completions，Anthropic 为 v1/messages；Base URL 已包含 /v1 时省略该前缀。"><Input required value={path} onChange={e => setPath(e.target.value)} placeholder="v1/chat/completions" /></Field>
-      <Field label="供应商 API Key（可选）" hint="填写后通过 Cloudflare API 存入 BYOK，自动生成新别名；不会把供应商密钥保存到 D1。"><Input type="password" autoComplete="new-password" value={secret} onChange={e => setSecret(e.target.value)} placeholder="输入新密钥交由 Cloudflare 保管" /></Field>
-      <Field label="已有 BYOK 别名" hint="未填写新密钥时，指定此服务商在当前 Gateway 的现有 BYOK 别名。"><Input value={alias} onChange={e => setAlias(e.target.value)} placeholder="例如 default" required={!secret && !channel?.has_secret} /></Field>
-      {channel?.has_secret && !channel.provider_id && <div className="info-note">此渠道来自旧版直连配置。关联到相同上游地址时会把旧密钥迁入 Cloudflare BYOK；尚未关联前不会继续直连。</div>}
+      <Field label="凭据保存方式"><Select value={credentialMode} onChange={value => { setCredentialMode(value); setSecret(''); }}><option value="local">程序加密存储（推荐）</option><option value="byok">使用已有 Cloudflare BYOK 别名</option></Select></Field>
+      {credentialMode === 'local' ? <Field label="供应商 API Key" hint="加密保存在本程序数据库，调用时由 AI Gateway 转发给供应商，无需 Secrets Store。编辑时留空保留原密钥；更换服务商或请求地址需重新填写。"><Input type="password" autoComplete="new-password" required={!(channel?.kind === 'openai' && channel.has_secret)} value={secret} onChange={e => setSecret(e.target.value)} placeholder={channel?.kind === 'openai' && channel.has_secret ? '已加密保存，留空保持不变' : '输入供应商 API Key'} /></Field>
+        : <Field label="已有 BYOK 别名" hint="填写此服务商在当前 AI Gateway 中已配置的别名。程序不会上传或修改 Cloudflare 的密钥。"><Input value={alias} onChange={e => setAlias(e.target.value)} placeholder="例如 default" required /></Field>}
+      {channel?.has_secret && !channel.provider_id && <div className="info-note">此渠道来自旧版直连配置。关联到相同上游地址后可继续使用已加密的密钥，推理会经过 AI Gateway。</div>}
     </> : <><div className="info-note">{kind === 'cloudflare' ? '使用 Cloudflare AI REST API 与统一计费。' : '调用 AI Gateway 的内置模型或 dynamic/ 动态路由；供应商凭据在 Cloudflare BYOK 配置。'} Account ID 和 Gateway ID 在 Worker 环境变量中配置。</div><Field label="Cloudflare Token（可选覆盖）" hint={`留空使用 ${kind === 'cloudflare' ? 'CF_AI_TOKEN' : 'CF_AIG_TOKEN / CF_API_TOKEN'}。`}><Input type="password" autoComplete="new-password" value={secret} onChange={e => setSecret(e.target.value)} placeholder={channel?.has_secret ? '已保存，留空保持不变' : '使用 Worker Secret'} /></Field></>}
     </FormSection><FormSection number="03" title="运行策略"><Field label="请求超时（秒）"><Input type="number" min={1} max={120} required value={timeout} onChange={e => setTimeoutValue(Number(e.target.value))} /></Field><Toggle checked={enabled} onChange={setEnabled} label="启用本地渠道" /></FormSection>
     <ErrorBox message={error} /><div className="modal-actions"><Button type="button" variant="secondary" onClick={onClose} disabled={busy}>取消</Button><Button disabled={busy}>{busy ? '正在配置 Cloudflare…' : '保存渠道'}</Button></div></form></Modal>;
@@ -96,8 +98,8 @@ export function Channels() {
         </>}</section><p className="page-footnote">配置状态反映本地连接信息的完整性，不代表上游实时可用性。</p>
       </>}
     </Tabs.Panel></Tabs>
-    <div className="security-note"><Cloud size={22} /><div><strong>请求经由 Cloudflare AI Gateway</strong><p>供应商凭据、缓存策略、日志采集与费用配置统一在 Cloudflare 管理。</p></div><a className="text-link" href="https://developers.cloudflare.com/ai-gateway/configuration/custom-providers/" target="_blank" rel="noreferrer">查看文档<ArrowUpRight size={16} /></a></div>
+    <div className="security-note"><Cloud size={22} /><div><strong>请求经由 Cloudflare AI Gateway</strong><p>供应商密钥默认由本程序加密保存；缓存、日志与费用配置由 Cloudflare 管理。</p></div><a className="text-link" href="https://developers.cloudflare.com/ai-gateway/configuration/custom-providers/" target="_blank" rel="noreferrer">查看文档<ArrowUpRight size={16} /></a></div>
     {editing !== undefined && <ChannelForm channel={editing} onClose={() => setEditing(undefined)} />}
-    {deleting && <Confirm title={`删除本地渠道 ${deleting.name}？`} description="此渠道及其模型路由会被移除。Cloudflare 的服务商、BYOK 密钥与日志会保留。" onConfirm={remove} onClose={() => setDeleting(null)} busy={busy} error={deleteError} />}
+    {deleting && <Confirm title={`删除本地渠道 ${deleting.name}？`} description="此渠道、加密保存的密钥及其模型路由会被移除。Cloudflare 的服务商、已有 BYOK 密钥与日志会保留。" onConfirm={remove} onClose={() => setDeleting(null)} busy={busy} error={deleteError} />}
   </>;
 }
