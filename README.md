@@ -1,5 +1,9 @@
 # EdgeGate
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/doitcan-oiu/cloudflare-workers-models-gateway)
+
+点击上方按钮即可进入 Cloudflare 部署向导，按提示创建 D1 / KV 并填写 AI Gateway 配置和 Secrets。首次部署所需的 Token 权限与参数见 [Workers 部署指南](./DEPLOYMENT.md)。
+
 基于 **Cloudflare Workers + AI Gateway + D1 + KV** 的大模型网关管理程序。React 19 + HeroUI 3 + Tailwind CSS 4 前端，Hono + TypeScript 后端。功能参考 AxonHub 的统一模型接入场景，目前为单管理员、单工作空间。
 
 **自定义服务商的推理请求全部经过 Cloudflare AI Gateway。** 本程序调用 Cloudflare API 管理服务商和 BYOK，直接读取 Cloudflare 日志与 GraphQL 分析，不再向 D1 写入推理日志或自行计算费用。

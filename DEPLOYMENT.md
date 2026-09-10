@@ -151,13 +151,17 @@ Node.js 版本可通过 `.node-version` 或 Build 环境变量 `NODE_VERSION=24`
 
 ## 4. 方式二：GitHub 一键部署按钮
 
-将代码放到**公开的 GitHub 仓库**后，把下面内容加入该仓库 README，替换 `YOUR_GITHUB_USER/YOUR_REPOSITORY`：
+README 顶部已提供一键部署按钮，也可以直接点击这里，使用本项目的公开 GitHub 仓库进入 Cloudflare 部署向导：
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/doitcan-oiu/cloudflare-workers-models-gateway)
+
+按钮使用的 Markdown 如下；如果你维护的是自己的 Fork，可将其中的 GitHub 地址换为自己的公开仓库地址：
 
 ```markdown
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/YOUR_GITHUB_USER/YOUR_REPOSITORY)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/doitcan-oiu/cloudflare-workers-models-gateway)
 ```
 
-此处提供模板，因为当前项目没有已配置的 GitHub 远程地址。公开模板建议保留初始资源占位 ID 和空的账户变量，部署者在流程里填写自己的配置。
+公开模板建议保留初始资源占位 ID 和空的账户变量，部署者在流程里填写自己的配置。按钮读取 GitHub 上的代码；本地修改提交后，需要推送到 GitHub，线上 README 和后续部署才会使用更新后的内容。
 
 点击按钮后的流程：
 
